@@ -18,6 +18,7 @@
 #include "fs.h"
 #include "hash.h"
 #include "init.h"
+#include "netbase.h"
 #include "policy/fees.h"
 #include "policy/policy.h"
 #include "policy/rbf.h"
@@ -42,7 +43,6 @@
 #include "versionbits.h"
 #include "warnings.h"
 
-#include <algorithm>
 #include <atomic>
 #include <sstream>
 
@@ -96,7 +96,7 @@ static void CheckBlockIndex(const Consensus::Params& consensusParams);
 /** Constant stuff for coinbase transactions we create: */
 CScript COINBASE_FLAGS;
 
-const std::string strMessageMagic = "Bitcoin Gold Signed Message:\n";
+const std::string strMessageMagic = "BitcoinNewYork Signed Message:\n";
 
 // Internal stuff
 namespace {
@@ -355,21 +355,25 @@ static bool IsCurrentForFeeEstimation()
     return true;
 }
 
-bool static IsBTGHardForkEnabled(int nHeight, const Consensus::Params& params) {
+bool static IsBTC2ProgForkEnabled(int nHeight, const Consensus::Params& params) {
+    return nHeight >= params.ProgForkHeight;
+}
+
+bool static IsBTC2HardForkEnabled(int nHeight, const Consensus::Params& params) {
     return nHeight >= params.BTGHeight;
 }
 
-bool IsBTGHardForkEnabled(const CBlockIndex* pindexPrev, const Consensus::Params& params) {
+bool IsBTC2HardForkEnabled(const CBlockIndex* pindexPrev, const Consensus::Params& params) {
     if (pindexPrev == nullptr) {
         return false;
     }
 
-    return IsBTGHardForkEnabled(pindexPrev->nHeight, params);
+    return IsBTC2HardForkEnabled(pindexPrev->nHeight, params);
 }
 
-bool IsBTGHardForkEnabledForCurrentBlock(const Consensus::Params& params) {
+bool IsBTC2HardForkEnabledForCurrentBlock(const Consensus::Params& params) {
     AssertLockHeld(cs_main);
-    return IsBTGHardForkEnabled(chainActive.Tip(), params);
+    return IsBTC2HardForkEnabled(chainActive.Tip(), params);
 }
 
 /* Make mempool consistent after a reorg, by re-adding or recursively erasing
@@ -860,7 +864,7 @@ static bool AcceptToMemoryPoolWorker(const CChainParams& chainparams, CTxMemPool
         // Remove conflicting transactions from the mempool
         for (const CTxMemPool::txiter it : allConflicting)
         {
-            LogPrint(BCLog::MEMPOOL, "replacing tx %s with %s for %s BTC additional fees, %d delta bytes\n",
+            LogPrint(BCLog::MEMPOOL, "replacing tx %s with %s for %s BTC2 additional fees, %d delta bytes\n",
                     it->GetTx().GetHash().ToString(),
                     hash.ToString(),
                     FormatMoney(nModifiedFees - nConflictingFees),
@@ -1091,11 +1095,22 @@ bool ReadBlockFromDisk(CBlock& block, const CDiskBlockPos& pos, const Consensus:
         return error("%s: Deserialize or I/O error - %s at %s", __func__, e.what(), pos.ToString());
     }
 
-    // Check Equihash solution
-    bool postfork = block.nHeight >= (uint32_t)consensusParams.BTGHeight;
-    if (postfork && !CheckEquihashSolution(&block, Params())) {
-        return error("ReadBlockFromDisk: Errors in block header at %s (bad Equihash solution)", pos.ToString());
+    // Check ProgPow/Equihash solution
+    bool postfork = false;
+    if (block.nHeight >= (uint32_t)consensusParams.ProgForkHeight) {
+        postfork = true;
+        if (!CheckProgPow(&block, Params())) {
+            return error("ReadBlockFromDisk: Errors in block header at %s (bad Progpow solution)", 
+                         pos.ToString());
+        }
+    } else if (block.nHeight >= (uint32_t)consensusParams.BTGHeight) {
+        postfork = true;
+        if (!CheckEquihashSolution(&block, Params())) {
+            return error("ReadBlockFromDisk: Errors in block header at %s (bad Equihash solution)",
+                          pos.ToString());
+        }
     }
+
     // Check the header
     if (!CheckProofOfWork(block.GetHash(), block.nBits, postfork, consensusParams))
         return error("ReadBlockFromDisk: Errors in block header at %s", pos.ToString());
@@ -1119,8 +1134,9 @@ CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
     // Force block reward to zero when right shift is undefined.
     if (halvings >= 64)
         return 0;
-
+    
     CAmount nSubsidy = 50 * COIN;
+
     // Subsidy is cut in half every 210,000 blocks which will occur approximately every 4 years.
     nSubsidy >>= halvings;
     return nSubsidy;
@@ -1145,7 +1161,10 @@ bool IsInitialBlockDownload()
         return true;
     if (chainActive.Tip()->nChainWork < UintToArith256(chainParams.GetConsensus().nMinimumChainWork))
         return true;
-    if (chainActive.Tip()->GetBlockTime() < (GetTime() - nMaxTipAge))
+    if (fSkipHardforkIBD && chainActive.Tip()->nHeight + 1 >= (int)chainParams.GetConsensus().BTGHeight)
+        return false;
+    int64_t target_time = fBTGBootstrapping ? (int64_t)chainParams.GetConsensus().BitcoinPostforkTime : GetTime();
+    if (chainActive.Tip()->GetBlockTime() < (target_time - nMaxTipAge))
         return true;
     LogPrintf("Leaving InitialBlockDownload (latching to false)\n");
     latchToFalse.store(true, std::memory_order_relaxed);
@@ -1621,8 +1640,7 @@ static DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* 
             }
             for (unsigned int j = tx.vin.size(); j-- > 0;) {
                 const COutPoint &out = tx.vin[j].prevout;
-                Coin &undo = txundo.vprevout[j];
-                int res = ApplyTxInUndo(std::move(undo), view, out);
+                int res = ApplyTxInUndo(std::move(txundo.vprevout[j]), view, out);
                 if (res == DISCONNECT_FAILED) return DISCONNECT_FAILED;
                 fClean = fClean && res != DISCONNECT_UNCLEAN;
 
@@ -1662,7 +1680,6 @@ static DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* 
             // At this point, all of txundo.vprevout should have been moved out.
         }
     }
-
 
     // move best block pointer to prevout block
     view.SetBestBlock(pindex->pprev->GetBlockHash());
@@ -1788,7 +1805,7 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex* pindex, const Consens
         flags |= SCRIPT_VERIFY_NULLDUMMY;
     }
 
-    if (IsBTGHardForkEnabled(pindex->pprev, consensusparams)) {
+    if (IsBTC2HardForkEnabled(pindex->pprev, consensusparams)) {
         flags |= SCRIPT_VERIFY_STRICTENC;
     } else {
         flags |= SCRIPT_ALLOW_NON_FORKID;
@@ -1813,7 +1830,6 @@ static int64_t nTimeTotal = 0;
 static bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockIndex* pindex,
                   CCoinsViewCache& view, const CChainParams& chainparams, bool fJustCheck = false, bool ignoreAddressIndex = false)
 {
-
     AssertLockHeld(cs_main);
     assert(pindex);
     // pindex->phashBlock can be null if called by CreateNewBlock/TestBlockValidity
@@ -1959,7 +1975,6 @@ static bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockInd
                 return state.DoS(100, error("%s: contains a non-BIP68-final transaction", __func__),
                                  REJECT_INVALID, "bad-txns-nonfinal");
             }
-
             if (fAddressIndex || fSpentIndex)
             {
                 for (size_t j = 0; j < tx.vin.size(); j++) {
@@ -2003,7 +2018,7 @@ static bool ConnectBlock(const CBlock& block, CValidationState& state, CBlockInd
         // * p2sh (when P2SH enabled in flags and excludes coinbase)
         // * witness (when witness enabled in flags and excludes coinbase)
         nSigOpsCost += GetTransactionSigOpCost(tx, view, flags);
-        if (nSigOpsCost > MAX_BLOCK_SIGOPS_COST)
+        if (nSigOpsCost > BitcoinX_MaxBlockSigOpsCost(pindex->nHeight, (flags & SCRIPT_VERIFY_WITNESS) ? true : false))
             return state.DoS(100, error("ConnectBlock(): too many sigops"),
                              REJECT_INVALID, "bad-blk-sigops");
 
@@ -3056,27 +3071,30 @@ static bool FindUndoPos(CValidationState &state, int nFile, CDiskBlockPos &pos, 
 
 static bool CheckBlockHeader(const CBlockHeader& block, CValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true)
 {
-    // Check Equihash solution is valid
     bool postfork = block.nHeight >= (uint32_t)consensusParams.BTGHeight;
     if (fCheckPOW && postfork) {
-        const CChainParams& chainparams = Params();
-        const size_t sol_size = chainparams.EquihashSolutionWidth(block.nHeight);
-        if(block.nSolution.size() != sol_size) {
-            return state.DoS(
-                100, error("CheckBlockHeader(): Equihash solution has invalid size have %d need %d",
-                           block.nSolution.size(), sol_size),
-                REJECT_INVALID, "invalid-solution-size");
-        }
-        if (!CheckEquihashSolution(&block, Params())) {
-            LogPrintf("CheckBlockHeader(): Equihash solution invalid at height %d\n", block.nHeight);
-            return state.DoS(100, error("CheckBlockHeader(): Equihash solution invalid"),
-                            REJECT_INVALID, "invalid-solution");
+        if ((block.nHeight < (uint32_t)consensusParams.ProgForkHeight)) {
+            // Check Equihash solution is valid
+            if (!CheckEquihashSolution(&block, Params())) {
+                LogPrintf("CheckBlockHeader(): Equihash solution invalid at height %d\n", block.nHeight);
+                return state.DoS(100, error("CheckBlockHeader(): Equihash solution invalid"),
+                                 REJECT_INVALID, "invalid-solution");
+            }
+        } else {
+            // Check ProgPow is valid 
+            if (!CheckProgPow(&block, Params())) {
+                LogPrintf("CheckBlockHeader(): ProgPow invalid at height %d\n", block.nHeight);
+                return state.DoS(100, error("CheckBlockHeader(): ProgPow invalid"),
+                                 REJECT_INVALID, "invalid-progpow");
+            }
         }
     }
 
     // Check proof of work matches claimed amount
-    if (fCheckPOW && !CheckProofOfWork(block.GetHash(), block.nBits, postfork, consensusParams))
+    if (fCheckPOW && !CheckProofOfWork(block.GetHash(), block.nBits, postfork, consensusParams)) {
+        error ("check proof of work failed");
         return state.DoS(50, false, REJECT_INVALID, "high-hash", false, "proof of work failed");
+    }
 
     return true;
 }
@@ -3090,21 +3108,24 @@ bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::P
 
     // Check that the header is valid (particularly PoW).  This is mostly
     // redundant with the call in AcceptBlockHeader.
-    if (!CheckBlockHeader(block, state, consensusParams, fCheckPOW))
+    if (!CheckBlockHeader(block, state, consensusParams, fCheckPOW)) {
         return false;
+    }
 
     // Check the merkle root.
     if (fCheckMerkleRoot) {
         bool mutated;
         uint256 hashMerkleRoot2 = BlockMerkleRoot(block, &mutated);
-        if (block.hashMerkleRoot != hashMerkleRoot2)
+        if (block.hashMerkleRoot != hashMerkleRoot2) {
             return state.DoS(100, false, REJECT_INVALID, "bad-txnmrklroot", true, "hashMerkleRoot mismatch");
+        }
 
         // Check for merkle tree malleability (CVE-2012-2459): repeating sequences
         // of transactions in a block without affecting the merkle root of a block,
         // while still invalidating it.
-        if (mutated)
+        if (mutated) {
             return state.DoS(100, false, REJECT_INVALID, "bad-txns-duplicate", true, "duplicate transaction");
+        }
     }
 
     // All potential-corruption validation must be done before we do any
@@ -3139,7 +3160,7 @@ bool CheckBlock(const CBlock& block, CValidationState& state, const Consensus::P
     {
         nSigOps += GetLegacySigOpCount(*tx);
     }
-    if (nSigOps * WITNESS_SCALE_FACTOR > MAX_BLOCK_SIGOPS_COST)
+    if (nSigOps * WITNESS_SCALE_FACTOR > BitcoinX_MaxBlockSigOpsCost())
         return state.DoS(100, false, REJECT_INVALID, "bad-blk-sigops", false, "out-of-bounds SigOpCount");
 
     if (fCheckPOW && fCheckMerkleRoot)
@@ -3221,7 +3242,7 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, CValidationSta
     // Check proof of work
     const Consensus::Params& consensusParams = params.GetConsensus();
     if (block.nBits != GetNextWorkRequired(pindexPrev, &block, consensusParams))
-        return state.DoS(100, false, REJECT_INVALID, "bad-diffbits", false, "incorrect proof of work");
+       return state.DoS(100, false, REJECT_INVALID, "bad-diffbits", false, "incorrect proof of work");
 
     // Check against checkpoints
     if (fCheckpointsEnabled) {
@@ -3242,8 +3263,7 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, CValidationSta
         return state.Invalid(false, REJECT_INVALID, "time-too-old", "block's timestamp is too early");
 
     // Check timestamp
-    if (block.GetBlockTime() > nAdjustedTime + std::min(consensusParams.BTGMaxFutureBlockTime,
-                                                        BITCOIN_MAX_FUTURE_BLOCK_TIME))
+    if (block.GetBlockTime() > nAdjustedTime + MAX_FUTURE_BLOCK_TIME)
         return state.Invalid(false, REJECT_INVALID, "time-too-new", "block timestamp too far in the future");
 
     // Reject outdated version blocks when 95% (75% on testnet) of the network has upgraded:
@@ -3288,9 +3308,9 @@ static bool ContextualCheckBlock(const CBlock& block, CValidationState& state, c
         }
     }
 
+    // This will skip with PremineWindow is set as 0
     if (nHeight >= consensusParams.BTGHeight &&
-        nHeight < consensusParams.BTGHeight + consensusParams.BTGPremineWindow &&
-        consensusParams.BTGPremineEnforceWhitelist)
+        nHeight < consensusParams.BTGHeight + consensusParams.BTGPremineWindow)
     {
         if (block.vtx[0]->vout.size() != 1) {
             return state.DoS(
@@ -3306,6 +3326,40 @@ static bool ContextualCheckBlock(const CBlock& block, CValidationState& state, c
         }
     }
 
+    // Coinbase transaction must include an output sending 10 or 20% of
+    // the block reward to a founders reward script, until the last founders
+    // reward block is reached.
+    if ((nHeight >= consensusParams.BTGHeight) && (nHeight <= Params().GetLastSoftFeeBlockHeight(nHeight))) {
+        bool found = false;
+
+        if (!block.vtx[0]->IsCoinBase()) {
+            return state.DoS(
+                100, error("%s: miner reward missing", __func__),
+                REJECT_INVALID, "missing-miner-coinbase-scriptpubkey");
+        }
+
+        CScript vFounderRewardScript = Params().GetFoundersRewardScriptAtHeight(nHeight);
+        for (const CTxOut& output :  block.vtx[0]->vout) {
+            if (output.scriptPubKey == vFounderRewardScript) {
+                auto vSoftReward = 0;
+                CAmount Subsidy = GetBlockSubsidy(nHeight, consensusParams);
+                if (nHeight <= consensusParams.nSoftInitialFeeInterval) {
+                    vSoftReward = Subsidy / 5;
+                } else {
+                    vSoftReward = Subsidy / 10;
+                }
+
+                if (output.nValue == vSoftReward) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+       if (!found) {
+            return state.DoS(100, error("%s: founders reward missing", __func__), REJECT_INVALID, "cb-no-founders-reward");
+       }
+    }
+
 
     // Validation for witness commitments.
     // * We compute the witness hash (which is the hash including witnesses) of all the block's transactions, except the
@@ -3316,7 +3370,9 @@ static bool ContextualCheckBlock(const CBlock& block, CValidationState& state, c
     //   {0xaa, 0x21, 0xa9, 0xed}, and the following 32 bytes are SHA256^2(witness root, witness nonce). In case there are
     //   multiple, the last one is used.
     bool fHaveWitness = false;
-    if (VersionBitsState(pindexPrev, consensusParams, Consensus::DEPLOYMENT_SEGWIT, versionbitscache) == THRESHOLD_ACTIVE) {
+	bool fSegwitSeasoned = false;
+	bool fSegWitActive = (VersionBitsState(pindexPrev, consensusParams, Consensus::DEPLOYMENT_SEGWIT, versionbitscache) == THRESHOLD_ACTIVE);
+    if (fSegWitActive) {
         int commitpos = GetWitnessCommitmentIndex(block);
         if (commitpos != -1) {
             bool malleated = false;
@@ -3333,7 +3389,17 @@ static bool ContextualCheckBlock(const CBlock& block, CValidationState& state, c
             }
             fHaveWitness = true;
         }
+		
+		const CBlockIndex* pindexForkBuffer = pindexPrev->GetAncestor(nHeight - BIPCOINX_FORK_BUFFER);
+		fSegwitSeasoned = (VersionBitsState(pindexForkBuffer, consensusParams, Consensus::DEPLOYMENT_SEGWIT, versionbitscache) == THRESHOLD_ACTIVE);
     }
+
+        int serialization_flags = SERIALIZE_TRANSACTION_NO_WITNESS;
+        if (block.nHeight < (uint32_t)consensusParams.BTGHeight) {
+            serialization_flags |= SERIALIZE_BLOCK_LEGACY;
+        }
+	if (::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION | serialization_flags) > BitcoinX_MaxBlockBaseSize(nHeight, fSegWitActive))
+		return state.DoS(100, false, REJECT_INVALID, "bad-blk-length", false, "size limits failed");
 
     // No witness data is allowed in blocks that don't commit to witness data, as this would otherwise leave room for spam
     if (!fHaveWitness) {
@@ -3344,13 +3410,21 @@ static bool ContextualCheckBlock(const CBlock& block, CValidationState& state, c
         }
     }
 
+	unsigned int nSigOps = 0;
+	for (const auto& tx : block.vtx)
+	{
+		nSigOps += GetLegacySigOpCount(*tx);
+	}
+	if (nSigOps * WITNESS_SCALE_FACTOR > BitcoinX_MaxBlockSigOpsCost(nHeight, fSegwitSeasoned))
+		return state.DoS(100, false, REJECT_INVALID, "bad-blk-sigops", false, "out-of-bounds SigOpCount");
+
     // After the coinbase witness nonce and commitment are verified,
     // we can check if the block weight passes (before we've checked the
     // coinbase witness, it would be possible for the weight to be too
     // large by filling up the coinbase witness, which doesn't change
     // the block hash, so we couldn't mark the block as permanently
     // failed).
-    if (GetBlockWeight(block, consensusParams) > MAX_BLOCK_WEIGHT) {
+    if (GetBlockWeight(block, consensusParams) > BitcoinX_MaxBlockWeight(nHeight, fSegwitSeasoned)) {
         return state.DoS(100, false, REJECT_INVALID, "bad-blk-weight", false, strprintf("%s : weight limit failed", __func__));
     }
 
@@ -3371,8 +3445,14 @@ static bool AcceptBlockHeader(const CBlockHeader& block, CValidationState& state
             pindex = miSelf->second;
             if (ppindex)
                 *ppindex = pindex;
-            if (pindex->nStatus & BLOCK_FAILED_MASK)
+            if (pindex->nStatus & BLOCK_FAILED_MASK) {
+                if (fBTGBootstrapping &&
+                    pindex->nHeight < chainparams.GetConsensus().BTGHeight) {
+	            pindex->nStatus &= ~BLOCK_FAILED_MASK;
+		    return true;
+                }
                 return state.Invalid(error("%s: block %s is marked invalid", __func__, hash.ToString()), 0, "duplicate");
+            }
             return true;
         }
 
@@ -3409,11 +3489,17 @@ bool ProcessNewBlockHeaders(const std::vector<CBlockHeader>& headers, CValidatio
         for (const CBlockHeader& header : headers) {
             CBlockIndex *pindex = nullptr; // Use a temp pindex instead of ppindex to avoid a const_cast
             if (!AcceptBlockHeader(header, state, chainparams, &pindex)) {
+                if (ppindex) {
+                   *ppindex = pindex;
+                }
                 return false;
             }
             if (ppindex) {
                 *ppindex = pindex;
             }
+            LogPrintf("%s: new header best=%s height=%d date='%s'\n", __func__,
+                pindex->GetBlockHash().ToString(), pindex->nHeight,
+                DateTimeStrFormat("%Y-%m-%d %H:%M:%S", pindex->GetBlockTime()));
         }
     }
     NotifyHeaderTip();
@@ -3431,8 +3517,9 @@ static bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, CValidation
     CBlockIndex *pindexDummy = nullptr;
     CBlockIndex *&pindex = ppindex ? *ppindex : pindexDummy;
 
-    if (!AcceptBlockHeader(block, state, chainparams, &pindex))
+    if (!AcceptBlockHeader(block, state, chainparams, &pindex)) {
         return false;
+    }
 
     // Try to process all requested blocks that we don't have, but only
     // process an unrequested block if it's new and has enough work to
@@ -3512,6 +3599,10 @@ bool ProcessNewBlock(const CChainParams& chainparams, const std::shared_ptr<cons
 
         LOCK(cs_main);
 
+        if (!ret) {
+            error("%s: CheckBlock %d FAILED", __func__, pblock->nHeight);
+        }
+
         if (ret) {
             // Store to disk
             ret = AcceptBlock(pblock, state, chainparams, &pindex, fForceProcessing, nullptr, fNewBlock);
@@ -3519,7 +3610,7 @@ bool ProcessNewBlock(const CChainParams& chainparams, const std::shared_ptr<cons
         CheckBlockIndex(chainparams.GetConsensus());
         if (!ret) {
             GetMainSignals().BlockChecked(*pblock, state);
-            return error("%s: AcceptBlock FAILED", __func__);
+            return error("%s: AcceptBlock %d FAILED", __func__, pblock->nHeight);
         }
     }
 
@@ -3974,8 +4065,7 @@ bool CVerifyDB::VerifyDB(const CChainParams& chainparams, CCoinsView *coinsview,
         // check level 3: check for inconsistencies during memory-only disconnect of tip blocks
         if (nCheckLevel >= 3 && pindex == pindexState && (coins.DynamicMemoryUsage() + pcoinsTip->DynamicMemoryUsage()) <= nCoinCacheUsage) {
             assert(coins.GetBestBlock() == pindex->GetBlockHash());
-            // just check, do not update the address index
-            DisconnectResult res = DisconnectBlock(block, pindex, coins, true);
+            DisconnectResult res = DisconnectBlock(block, pindex, coins);
             if (res == DISCONNECT_FAILED) {
                 return error("VerifyDB(): *** irrecoverable inconsistency in block data at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
             }
@@ -4003,7 +4093,7 @@ bool CVerifyDB::VerifyDB(const CChainParams& chainparams, CCoinsView *coinsview,
             CBlock block;
             if (!ReadBlockFromDisk(block, pindex, chainparams.GetConsensus()))
                 return error("VerifyDB(): *** ReadBlockFromDisk failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
-            if (!ConnectBlock(block, state, pindex, coins, chainparams, false, true))
+            if (!ConnectBlock(block, state, pindex, coins, chainparams))
                 return error("VerifyDB(): *** found unconnectable block at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
         }
     }
@@ -4240,7 +4330,6 @@ bool LoadBlockIndex(const CChainParams& chainparams)
         // needs_init.
 
         LogPrintf("Initializing databases...\n");
-
         // Use the provided setting for -txindex in the new database
         fTxIndex = gArgs.GetBoolArg("-txindex", DEFAULT_TXINDEX);
         pblocktree->WriteFlag("txindex", fTxIndex);
