@@ -43,6 +43,7 @@
 #include "versionbits.h"
 #include "warnings.h"
 
+#include <algorithm>
 #include <atomic>
 #include <sstream>
 
@@ -1641,6 +1642,7 @@ static DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* 
             for (unsigned int j = tx.vin.size(); j-- > 0;) {
                 const COutPoint &out = tx.vin[j].prevout;
                 int res = ApplyTxInUndo(std::move(txundo.vprevout[j]), view, out);
+                Coin &undo = txundo.vprevout[j];
                 if (res == DISCONNECT_FAILED) return DISCONNECT_FAILED;
                 fClean = fClean && res != DISCONNECT_UNCLEAN;
 
