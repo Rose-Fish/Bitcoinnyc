@@ -123,6 +123,7 @@ public:
     bool GetKeyID(CKeyID &keyID) const;
     bool GetKeyID(CKeyID &keyID, const CChainParams &params) const;
     bool IsScript() const;
+    bool GetIndexKey(uint160& hashBytes, int& type) const;
 };
 
 /**

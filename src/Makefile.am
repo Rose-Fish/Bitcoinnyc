@@ -78,6 +78,9 @@ endif
 .PHONY: FORCE check-symbols check-security
 # bitcoin core #
 BITCOIN_CORE_H = \
+  addressindex.h \
+  spentindex.h \
+  timestampindex.h \
   addrdb.h \
   addrman.h \
   base58.h \
